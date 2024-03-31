@@ -1,139 +1,273 @@
-import os
-import tempfile
+# app.py
+from typing import List, Union, Optional
+
+from dotenv import load_dotenv, find_dotenv
+from langchain.callbacks import get_openai_callback
+from langchain.chat_models import ChatOpenAI
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.schema import (SystemMessage, HumanMessage, AIMessage)
+from langchain.llms import LlamaCpp
+from langchain.embeddings import LlamaCppEmbeddings
+from langchain.callbacks.manager import CallbackManager
+from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+from langchain.text_splitter import TokenTextSplitter
+from langchain.prompts import PromptTemplate
+from langchain.vectorstores import Qdrant
+from PyPDF2 import PdfReader
 import streamlit as st
-from streamlit_chat import message
 
-# LangChain Community imports
-from langchain_community.vectorstores import Chroma
-from langchain_community.chat_models import ChatOllama
-from langchain_community.embeddings import FastEmbedEmbeddings
-from langchain_core.output_parsers import StrOutputParser
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.vectorstores.utils import filter_complex_metadata
+PROMPT_TEMPLATE = """
+Use the following pieces of context enclosed by triple backquotes to answer the question at the end.
+\n\n
+Context:
+```
+{context}
+```
+\n\n
+Question: [][][][]{question}[][][][]
+\n
+Answer:"""
 
 
-class ChatPDFAssistant:
-    """Handles PDF ingestion, query processing, and answering queries using a chat model."""
-    
-    def __init__(self):
-        self.model = ChatOllama(model="mistral") # Modify based on actual implementation
-        self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1024, chunk_overlap=100)
-        self.prompt = self._create_prompt_template()
-        self.vector_store = None
-        self.retriever = None
-        self.chain = None
+def init_page() -> None:
+    st.set_page_config(
+        page_title="Personal ChatGPT"
+    )
+    st.sidebar.title("Options")
 
-    @staticmethod
-    def _create_prompt_template():
-        return ChatPromptTemplate.from_template(
-            """
-            <s> [INST] 
-            You are an AI assistant with access to specific text snippets for answering questions.
-            Your answers must be directly based only on the provided context.
-            If the context does not contain enough information for a definitive answer, say that you don't know and ask the user to provide additional information. 
-            [/INST] </s> 
-            [INST] 
-            Question: {question} 
-            Context: {context} 
-            Answer: 
-            [/INST]
-            """
+
+def init_messages() -> None:
+    clear_button = st.sidebar.button("Clear Conversation", key="clear")
+    if clear_button or "messages" not in st.session_state:
+        st.session_state.messages = [
+            SystemMessage(
+                content=(
+                    "You are a helpful AI QA assistant. "
+                    "When answering questions, use the context enclosed by triple backquotes if it is relevant. "
+                    "If you don't know the answer, just say that you don't know, "
+                    "don't try to make up an answer. "
+                    "Reply your answer in mardkown format.")
+            )
+        ]
+        st.session_state.costs = []
+
+
+def get_pdf_text() -> Optional[str]:
+    """
+    Function to load PDF text and split it into chunks.
+    """
+    st.header("Document Upload")
+    uploaded_file = st.file_uploader(
+        label="Here, upload your PDF file you want ChatGPT to use to answer",
+        type="pdf"
+    )
+    if uploaded_file:
+        pdf_reader = PdfReader(uploaded_file)
+        text = "\n\n".join([page.extract_text() for page in pdf_reader.pages])
+        text_splitter = TokenTextSplitter(chunk_size=100, chunk_overlap=0)
+        return text_splitter.split_text(text)
+    else:
+        return None
+
+
+def build_vectore_store(
+    texts: str, embeddings: Union[OpenAIEmbeddings, LlamaCppEmbeddings]) \
+        -> Optional[Qdrant]:
+    """
+    Store the embedding vectors of text chunks into vector store (Qdrant).
+    """
+    if texts:
+        with st.spinner("Loading PDF ..."):
+            qdrant = Qdrant.from_texts(
+                texts,
+                embeddings,
+                path=":memory:",
+                collection_name="my_collection",
+                force_recreate=True
+            )
+        st.success("File Loaded Successfully!!")
+    else:
+        qdrant = None
+    return qdrant
+
+
+def select_llm() -> Union[ChatOpenAI, LlamaCpp]:
+    """
+    Read user selection of parameters in Streamlit sidebar.
+    """
+    model_name = st.sidebar.radio("Choose LLM:",
+                                  ("gpt-3.5-turbo-0613",
+                                   "gpt-3.5-turbo-16k-0613",
+                                   "gpt-4",
+                                   "llama-2-7b-chat.ggmlv3.q2_K"))
+    temperature = st.sidebar.slider("Temperature:", min_value=0.0,
+                                    max_value=1.0, value=0.0, step=0.01)
+    return model_name, temperature
+
+
+def load_llm(model_name: str, temperature: float) -> Union[ChatOpenAI, LlamaCpp]:
+    """
+    Load LLM.
+    """
+    if model_name.startswith("gpt-"):
+        return ChatOpenAI(temperature=temperature, model_name=model_name)
+    elif model_name.startswith("llama-2-"):
+        callback_manager = CallbackManager([StreamingStdOutCallbackHandler()])
+        return LlamaCpp(
+            model_path=f"./models/{model_name}.bin",
+            input={"temperature": temperature,
+                   "max_length": 2048,
+                   "top_p": 1
+                   },
+            n_ctx=2048,
+            callback_manager=callback_manager,
+            verbose=False,  # True
         )
-        
-    def ingest_pdf(self, pdf_file_path: str):
-        docs = PyPDFLoader(file_path=pdf_file_path).load()
-        chunks = self.text_splitter.split_documents(docs)
-        chunks = filter_complex_metadata(chunks)
-        self.vector_store = Chroma.from_documents(documents=chunks, embedding=FastEmbedEmbeddings())
-        self._prepare_retriever()
 
-    def _prepare_retriever(self):
-        self.retriever = self.vector_store.as_retriever(
-            search_type="similarity_score_threshold",
-            search_kwargs={"k": 3, "score_threshold": 0.5},
-        )
-        self.chain = ({"context": self.retriever, "question": RunnablePassthrough()}
-                      | self.prompt
-                      | self.model
-                      | StrOutputParser())
 
-    def ask(self, query: str):
-        if not self.chain:
-            return "Please, add a PDF document first."
-        return self.chain.invoke(query)
+def load_embeddings(model_name: str) -> Union[OpenAIEmbeddings, LlamaCppEmbeddings]:
+    """
+    Load embedding model.
+    """
+    if model_name.startswith("gpt-"):
+        return OpenAIEmbeddings()
+    elif model_name.startswith("llama-2-"):
+        return LlamaCppEmbeddings(model_path=f"./models/{model_name}.bin")
 
-    def clear(self):
-        self.vector_store = None
-        self.retriever = None
-        self.chain = None
 
-def setup_streamlit_page():
-    st.set_page_config(page_title="Chat privately with your PDFs using a local LLM (Mistral 7B) and RAG", layout="wide")
-    st.sidebar.title("Document Management")
-    st.sidebar.text("Upload or clear documents here.")
+def get_answer(llm, messages) -> tuple[str, float]:
+    """
+    Get the AI answer to user questions.
+    """
+    if isinstance(llm, ChatOpenAI):
+        with get_openai_callback() as cb:
+            answer = llm(messages)
+        return answer.content, cb.total_cost
+    if isinstance(llm, LlamaCpp):
+        return llm(llama_v2_prompt(convert_langchainschema_to_dict(messages))), 0.0
 
-    # Initialize 'assistant' in session state if not already present
-    if "assistant" not in st.session_state:
-        st.session_state["assistant"] = ChatPDFAssistant()
 
-def display_chat_interface():
-    st.subheader("Local Chatbot")
-    chat_container = st.container()
-    with chat_container:
-        if "messages" not in st.session_state:
-            st.session_state["messages"] = []
-        for i, (msg, is_user) in enumerate(st.session_state["messages"]):
-            message(msg, is_user=is_user, key=str(i))
-    if "thinking_spinner" not in st.session_state:
-        st.session_state["thinking_spinner"] = st.empty()
+def find_role(message: Union[SystemMessage, HumanMessage, AIMessage]) -> str:
+    """
+    Identify role name from langchain.schema object.
+    """
+    if isinstance(message, SystemMessage):
+        return "system"
+    if isinstance(message, HumanMessage):
+        return "user"
+    if isinstance(message, AIMessage):
+        return "assistant"
+    raise TypeError("Unknown message type.")
 
-def handle_file_upload():
-    # Check if 'assistant' is initialized before trying to clear it
-    if "assistant" in st.session_state:
-        st.session_state["assistant"].clear()
-        st.session_state["messages"] = []
-        st.session_state["user_input"] = ""
 
-    for file in st.session_state["file_uploader"]:
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_file.write(file.getbuffer())
-            file_path = temp_file.name
+def convert_langchainschema_to_dict(
+        messages: List[Union[SystemMessage, HumanMessage, AIMessage]]) \
+        -> List[dict]:
+    """
+    Convert the chain of chat messages in list of langchain.schema format to
+    list of dictionary format.
+    """
+    return [{"role": find_role(message),
+             "content": message.content
+             } for message in messages]
 
-        if "ingestion_spinner" not in st.session_state:
-            st.session_state["ingestion_spinner"] = st.empty()
-        
-        with st.session_state["ingestion_spinner"], st.spinner(f"Ingesting {file.name}"):
-            st.session_state["assistant"].ingest_pdf(file_path)
-        os.remove(file_path)
 
-def setup_chat_page():
-    setup_sidebar()
-    st.header("Chat privately with your PDFs using a local LLM (Mistral 7B) and RAG")
-    display_chat_interface()
-    st.text_input("Message", key="user_input", on_change=process_user_input)
+def llama_v2_prompt(messages: List[dict]) -> str:
+    """
+    Convert the messages in list of dictionary format to Llama2 compliant
+    format.
+    """
+    B_INST, E_INST = "[INST]", "[/INST]"
+    B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
+    BOS, EOS = "<s>", "</s>"
+    DEFAULT_SYSTEM_PROMPT = f"""You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Please ensure that your responses are socially unbiased and positive in nature. If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."""
 
-def setup_sidebar():
-    st.sidebar.file_uploader("Upload new document", type=["pdf"], key="file_uploader",
-                             on_change=handle_file_upload, label_visibility="collapsed",
-                             accept_multiple_files=True)
-    if st.sidebar.button("Clear Documents"):
-        # Check if 'assistant' is initialized before trying to clear it
-        if "assistant" in st.session_state:
-            st.session_state["assistant"].clear()
-        st.session_state["messages"] = []
+    if messages[0]["role"] != "system":
+        messages = [
+            {
+                "role": "system",
+                "content": DEFAULT_SYSTEM_PROMPT,
+            }
+        ] + messages
+    messages = [
+        {
+            "role": messages[1]["role"],
+            "content": B_SYS + messages[0]["content"] + E_SYS + messages[1]["content"],
+        }
+    ] + messages[2:]
 
-def process_user_input():
-    user_text = st.session_state["user_input"].strip()
-    if user_text:
-        with st.session_state["thinking_spinner"], st.spinner("Thinking"):
-            agent_text = st.session_state["assistant"].ask(user_text)
+    messages_list = [
+        f"{BOS}{B_INST} {(prompt['content']).strip()} {E_INST} {(answer['content']).strip()} {EOS}"
+        for prompt, answer in zip(messages[::2], messages[1::2])
+    ]
+    messages_list.append(
+        f"{BOS}{B_INST} {(messages[-1]['content']).strip()} {E_INST}")
 
-        st.session_state["messages"].append((user_text, True))
-        st.session_state["messages"].append((agent_text, False))
+    return "".join(messages_list)
 
+
+def extract_userquesion_part_only(content):
+    """
+    Function to extract only the user question part from the entire question
+    content combining user question and pdf context.
+    """
+    content_split = content.split("[][][][]")
+    if len(content_split) == 3:
+        return content_split[1]
+    return content
+
+
+def main() -> None:
+    _ = load_dotenv(find_dotenv())
+
+    init_page()
+
+    model_name, temperature = select_llm()
+    llm = load_llm(model_name, temperature)
+    embeddings = load_embeddings(model_name)
+
+    texts = get_pdf_text()
+    qdrant = build_vectore_store(texts, embeddings)
+
+    init_messages()
+
+    st.header("Personal ChatGPT")
+    # Supervise user input
+    if user_input := st.chat_input("Input your question!"):
+        if qdrant:
+            context = [c.page_content for c in qdrant.similarity_search(
+                user_input, k=10)]
+            user_input_w_context = PromptTemplate(
+                template=PROMPT_TEMPLATE,
+                input_variables=["context", "question"]) \
+                .format(
+                    context=context, question=user_input)
+        else:
+            user_input_w_context = user_input
+        st.session_state.messages.append(
+            HumanMessage(content=user_input_w_context))
+        with st.spinner("ChatGPT is typing ..."):
+            answer, cost = get_answer(llm, st.session_state.messages)
+        st.session_state.messages.append(AIMessage(content=answer))
+        st.session_state.costs.append(cost)
+
+    # Display chat history
+    messages = st.session_state.get("messages", [])
+    for message in messages:
+        if isinstance(message, AIMessage):
+            with st.chat_message("assistant"):
+                st.markdown(message.content)
+        elif isinstance(message, HumanMessage):
+            with st.chat_message("user"):
+                st.markdown(extract_userquesion_part_only(message.content))
+
+    costs = st.session_state.get("costs", [])
+    st.sidebar.markdown("## Costs")
+    st.sidebar.markdown(f"**Total cost: ${sum(costs):.5f}**")
+    for cost in costs:
+        st.sidebar.markdown(f"- ${cost:.5f}")
+
+
+# streamlit run app.py
 if __name__ == "__main__":
-    setup_streamlit_page()
-    setup_chat_page()
+    main()
