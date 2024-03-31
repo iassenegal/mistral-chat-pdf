@@ -1,6 +1,7 @@
 langchain
 streamlit 
 streamlit_chat 
+PyPDF2
 chromadb 
 pypdf 
 fastembed
