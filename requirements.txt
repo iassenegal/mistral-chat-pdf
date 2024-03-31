@@ -1,1 +1,6 @@
-langchain-community streamlit streamlit_chat chromadb pypdf fastembed
+langchain-community 
+streamlit 
+streamlit_chat 
+chromadb 
+pypdf 
+fastembed
